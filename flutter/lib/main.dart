@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:bot_toast/bot_toast.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/pages/install_page.dart';
 import 'package:flutter_hbb/desktop/pages/server_page.dart';
@@ -32,9 +33,6 @@ import 'models/platform_model.dart';
 int? kWindowId;
 WindowType? kWindowType;
 late List<String> kBootArgs;
-
-/// Uni links.
-StreamSubscription? _uniLinkSubscription;
 
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -93,7 +91,7 @@ Future<void> main(List<String> args) async {
     debugPrint("--cm started");
     desktopType = DesktopType.cm;
     await windowManager.ensureInitialized();
-    runConnectionManagerScreen(args.contains('--hide'));
+    runConnectionManagerScreen();
   } else if (args.contains('--install')) {
     runInstallPage();
   } else {
@@ -123,11 +121,11 @@ void runMainApp(bool startService) async {
   // trigger connection status updater
   await bind.mainCheckConnectStatus();
   if (startService) {
-    // await windowManager.ensureInitialized();
     gFFI.serverModel.startService();
     bind.pluginSyncUi(syncTo: kAppTypeMain);
     bind.pluginListReload();
   }
+  await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
   gFFI.userModel.refreshCurrentUser();
   runApp(App());
   // Set window option.
@@ -138,7 +136,7 @@ void runMainApp(bool startService) async {
     // Check the startup argument, if we successfully handle the argument, we keep the main window hidden.
     final handledByUniLinks = await initUniLinks();
     debugPrint("handled by uni links: $handledByUniLinks");
-    if (handledByUniLinks || checkArguments()) {
+    if (handledByUniLinks || handleUriLink(cmdArgs: kBootArgs)) {
       windowManager.hide();
     } else {
       windowManager.show();
@@ -155,7 +153,10 @@ void runMobileApp() async {
   await initEnv(kAppTypeMain);
   if (isAndroid) androidChannelInit();
   platformFFI.syncAndroidServiceAppDirConfigPath();
+  await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
+  gFFI.userModel.refreshCurrentUser();
   runApp(App());
+  await initUniLinks();
 }
 
 void runMultiWindow(
@@ -198,8 +199,16 @@ void runMultiWindow(
   }
   switch (appType) {
     case kAppTypeDesktopRemote:
-      await restoreWindowPosition(WindowType.RemoteDesktop,
-          windowId: kWindowId!);
+      // If screen rect is set, the window will be moved to the target screen and then set fullscreen.
+      if (argument['screen_rect'] == null) {
+        // display can be used to control the offset of the window.
+        await restoreWindowPosition(
+          WindowType.RemoteDesktop,
+          windowId: kWindowId!,
+          peerId: argument['id'] as String?,
+          display: argument['display'] as int?,
+        );
+      }
       break;
     case kAppTypeDesktopFileTransfer:
       await restoreWindowPosition(WindowType.FileTransfer,
@@ -216,44 +225,72 @@ void runMultiWindow(
   WindowController.fromWindowId(kWindowId!).show();
 }
 
-void runConnectionManagerScreen(bool hide) async {
+void runConnectionManagerScreen() async {
   await initEnv(kAppTypeConnectionManager);
   _runApp(
     '',
     const DesktopServerPage(),
     MyTheme.currentThemeMode(),
   );
+  final hide = await bind.cmGetConfig(name: "hide_cm") == 'true';
+  gFFI.serverModel.hideCm = hide;
   if (hide) {
-    hideCmWindow();
+    await hideCmWindow(isStartup: true);
   } else {
-    showCmWindow();
+    await showCmWindow(isStartup: true);
   }
+  windowManager.setResizable(false);
   // Start the uni links handler and redirect links to Native, not for Flutter.
-  _uniLinkSubscription = listenUniLinks(handleByFlutter: false);
+  listenUniLinks(handleByFlutter: false);
 }
 
-void showCmWindow() {
-  WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
-      size: kConnectionManagerWindowSizeClosedChat);
-  windowManager.waitUntilReadyToShow(windowOptions, () async {
+bool _isCmReadyToShow = false;
+
+showCmWindow({bool isStartup = false}) async {
+  if (isStartup) {
+    WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
+        size: kConnectionManagerWindowSizeClosedChat);
+    await windowManager.waitUntilReadyToShow(windowOptions, null);
     bind.mainHideDocker();
-    await windowManager.show();
-    await Future.wait([windowManager.focus(), windowManager.setOpacity(1)]);
+    await Future.wait([
+      windowManager.show(),
+      windowManager.focus(),
+      windowManager.setOpacity(1)
+    ]);
     // ensure initial window size to be changed
     await windowManager.setSizeAlignment(
         kConnectionManagerWindowSizeClosedChat, Alignment.topRight);
-  });
+    _isCmReadyToShow = true;
+  } else if (_isCmReadyToShow) {
+    if (await windowManager.getOpacity() != 1) {
+      await windowManager.setOpacity(1);
+      await windowManager.focus();
+      await windowManager.minimize(); //needed
+      await windowManager.setSizeAlignment(
+          kConnectionManagerWindowSizeClosedChat, Alignment.topRight);
+      windowOnTop(null);
+    }
+  }
 }
 
-void hideCmWindow() {
-  WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
-      size: kConnectionManagerWindowSizeClosedChat);
-  windowManager.setOpacity(0);
-  windowManager.waitUntilReadyToShow(windowOptions, () async {
+hideCmWindow({bool isStartup = false}) async {
+  if (isStartup) {
+    WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
+        size: kConnectionManagerWindowSizeClosedChat);
+    windowManager.setOpacity(0);
+    await windowManager.waitUntilReadyToShow(windowOptions, null);
     bind.mainHideDocker();
     await windowManager.minimize();
     await windowManager.hide();
-  });
+    _isCmReadyToShow = true;
+  } else if (_isCmReadyToShow) {
+    if (await windowManager.getOpacity() != 0) {
+      await windowManager.setOpacity(0);
+      bind.mainHideDocker();
+      await windowManager.minimize();
+      await windowManager.hide();
+    }
+  }
 }
 
 void _runApp(
@@ -376,7 +413,7 @@ class _AppState extends State<App> {
           themeMode: MyTheme.currentThemeMode(),
           home: isDesktop
               ? const DesktopTabPage()
-              : !isAndroid
+              : isWeb
                   ? WebHomePage()
                   : HomePage(),
           localizationsDelegates: const [
@@ -401,6 +438,9 @@ class _AppState extends State<App> {
               : (context, child) {
                   child = _keepScaleBuilder(context, child);
                   child = botToastBuilder(context, child);
+                  if (isDesktop && desktopType == DesktopType.main) {
+                    child = keyListenerBuilder(context, child);
+                  }
                   return child;
                 },
         ),
@@ -436,4 +476,20 @@ _registerEventHandler() {
       NativeUiHandler.instance.onEvent(evt);
     });
   }
+}
+
+Widget keyListenerBuilder(BuildContext context, Widget? child) {
+  return RawKeyboardListener(
+    focusNode: FocusNode(),
+    child: child ?? Container(),
+    onKey: (RawKeyEvent event) {
+      if (event.logicalKey == LogicalKeyboardKey.shiftLeft) {
+        if (event is RawKeyDownEvent) {
+          gFFI.peerTabModel.setShiftDown(true);
+        } else if (event is RawKeyUpEvent) {
+          gFFI.peerTabModel.setShiftDown(false);
+        }
+      }
+    },
+  );
 }

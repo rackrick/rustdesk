@@ -33,11 +33,7 @@ Dưới đây là những máy chủ mà bạn có thể sử dụng mà không 
 
 | Địa điểm | Nhà cung cấp | Cấu hình |
 | --------- | ------------- | ------------------ |
-| Seoul | AWS lightsail | 1 vCPU / 0.5GB RAM |
 | Germany | Hetzner | 2 vCPU / 4GB RAM |
-| Germany | Codext | 4 vCPU / 8GB RAM |
-| Finland (Helsinki) | 0x101 Cyber Security | 4 vCPU / 8GB RAM |
-| USA (Ashburn) | 0x101 Cyber Security | 4 vCPU / 8GB RAM |
 
 ## Dependencies
 
@@ -119,10 +115,6 @@ wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/lib
 mv libsciter-gtk.so target/debug
 VCPKG_ROOT=$HOME/vcpkg cargo run
 ```
-
-### Chuyển từ Wayland sang X11 (Xorg)
-
-RustDesk hiện không hỗ trợ Wayland. Hãy xem [đường linh ở đây](https://docs.fedoraproject.org/en-US/quick-docs/configuring-xorg-as-default-gnome-session/) cách để cài đặt Xorg làm session mặc định của GNOME.
 
 ## Cách để build sử dụng Docker
 

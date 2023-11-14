@@ -3,10 +3,7 @@ use std::{
     net::SocketAddr,
     ops::Deref,
     str::FromStr,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex, RwLock,
-    },
+    sync::{mpsc, Arc, Mutex, RwLock},
 };
 
 pub use async_trait::async_trait;
@@ -24,6 +21,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub use file_trait::FileManager;
+#[cfg(windows)]
+use hbb_common::tokio;
 #[cfg(not(feature = "flutter"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::tokio::sync::mpsc::UnboundedSender;
@@ -32,7 +31,8 @@ use hbb_common::{
     anyhow::{anyhow, Context},
     bail,
     config::{
-        Config, PeerConfig, PeerInfoSerde, Resolution, CONNECT_TIMEOUT, READ_TIMEOUT, RELAY_PORT,
+        Config, LocalConfig, PeerConfig, PeerInfoSerde, Resolution, CONNECT_TIMEOUT,
+        PUBLIC_RS_PUB_KEY, READ_TIMEOUT, RELAY_PORT, RENDEZVOUS_PORT, RENDEZVOUS_SERVERS,
     },
     get_version_number, log,
     message_proto::{option_message::BoolOption, *},
@@ -40,6 +40,7 @@ use hbb_common::{
     rand,
     rendezvous_proto::*,
     socket_client,
+    sodiumoxide::base64,
     sodiumoxide::crypto::{box_, secretbox, sign},
     tcp::FramedStream,
     timeout,
@@ -53,13 +54,18 @@ use scrap::{
     ImageFormat, ImageRgb,
 };
 
-use crate::common::{self, is_keyboard_mode_supported};
+use crate::{
+    check_port,
+    common::input::{MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP},
+    is_keyboard_mode_supported,
+    ui_session_interface::{InvokeUiSession, Session},
+};
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::common::{check_clipboard, ClipboardContext, CLIPBOARD_INTERVAL};
 #[cfg(not(feature = "flutter"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::ui_session_interface::SessionPermissionConfig;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::{check_clipboard, ClipboardContext, CLIPBOARD_INTERVAL};
 
 pub use super::lang::*;
 
@@ -88,6 +94,7 @@ pub const LOGIN_MSG_PASSWORD_EMPTY: &str = "Empty Password";
 pub const LOGIN_MSG_PASSWORD_WRONG: &str = "Wrong Password";
 pub const LOGIN_MSG_NO_PASSWORD_ACCESS: &str = "No Password Access";
 pub const LOGIN_MSG_OFFLINE: &str = "Offline";
+pub const LOGIN_SCREEN_WAYLAND: &str = "Wayland login screen is not supported";
 #[cfg(target_os = "linux")]
 pub const SCRAP_UBUNTU_HIGHER_REQUIRED: &str = "Wayland requires Ubuntu 21.04 or higher version.";
 #[cfg(target_os = "linux")]
@@ -127,6 +134,8 @@ lazy_static::lazy_static! {
     static ref OLD_CLIPBOARD_TEXT: Arc<Mutex<String>> = Default::default();
     static ref TEXT_CLIPBOARD_STATE: Arc<Mutex<TextClipboardState>> = Arc::new(Mutex::new(TextClipboardState::new()));
 }
+
+const PUBLIC_SERVER: &str = "public";
 
 #[inline]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -213,6 +222,9 @@ impl Client {
         conn_type: ConnType,
         interface: impl Interface,
     ) -> ResultType<(Stream, bool, Option<Vec<u8>>)> {
+        debug_assert!(peer == interface.get_id());
+        interface.update_direct(None);
+        interface.update_received(false);
         match Self::_start(peer, key, token, conn_type, interface).await {
             Err(err) => {
                 let err_str = err.to_string();
@@ -237,11 +249,8 @@ impl Client {
         // to-do: remember the port for each peer, so that we can retry easier
         if hbb_common::is_ip_str(peer) {
             return Ok((
-                socket_client::connect_tcp(
-                    crate::check_port(peer, RELAY_PORT + 1),
-                    CONNECT_TIMEOUT,
-                )
-                .await?,
+                socket_client::connect_tcp(check_port(peer, RELAY_PORT + 1), CONNECT_TIMEOUT)
+                    .await?,
                 true,
                 None,
             ));
@@ -254,12 +263,36 @@ impl Client {
                 None,
             ));
         }
-        let (mut rendezvous_server, servers, contained) = crate::get_rendezvous_server(1_000).await;
+
+        let other_server = interface.get_lch().read().unwrap().other_server.clone();
+        let (peer, other_server, key, token) = if let Some((a, b, c)) = other_server.as_ref() {
+            (a.as_ref(), b.as_ref(), c.as_ref(), "")
+        } else {
+            (peer, "", key, token)
+        };
+        let (mut rendezvous_server, servers, contained) = if other_server.is_empty() {
+            crate::get_rendezvous_server(1_000).await
+        } else {
+            if other_server == PUBLIC_SERVER {
+                (
+                    check_port(RENDEZVOUS_SERVERS[0], RENDEZVOUS_PORT),
+                    RENDEZVOUS_SERVERS[1..]
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect(),
+                    true,
+                )
+            } else {
+                (check_port(other_server, RENDEZVOUS_PORT), Vec::new(), true)
+            }
+        };
+
         let mut socket = socket_client::connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
         debug_assert!(!servers.contains(&rendezvous_server));
         if socket.is_err() && !servers.is_empty() {
             log::info!("try the other servers: {:?}", servers);
             for server in servers {
+                let server = check_port(server, RENDEZVOUS_PORT);
                 socket = socket_client::connect_tcp(&*server, CONNECT_TIMEOUT).await;
                 if socket.is_ok() {
                     rendezvous_server = server;
@@ -305,7 +338,7 @@ impl Client {
             });
             socket.send(&msg_out).await?;
             if let Some(msg_in) =
-                crate::common::get_next_nonkeyexchange_msg(&mut socket, Some(i * 6000)).await
+                crate::get_next_nonkeyexchange_msg(&mut socket, Some(i * 6000)).await
             {
                 match msg_in.union {
                     Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
@@ -313,19 +346,20 @@ impl Client {
                             if !ph.other_failure.is_empty() {
                                 bail!(ph.other_failure);
                             }
-                            match ph.failure.enum_value_or_default() {
-                                punch_hole_response::Failure::ID_NOT_EXIST => {
+                            match ph.failure.enum_value() {
+                                Ok(punch_hole_response::Failure::ID_NOT_EXIST) => {
                                     bail!("ID does not exist");
                                 }
-                                punch_hole_response::Failure::OFFLINE => {
+                                Ok(punch_hole_response::Failure::OFFLINE) => {
                                     bail!("Remote desktop is offline");
                                 }
-                                punch_hole_response::Failure::LICENSE_MISMATCH => {
+                                Ok(punch_hole_response::Failure::LICENSE_MISMATCH) => {
                                     bail!("Key mismatch");
                                 }
-                                punch_hole_response::Failure::LICENSE_OVERUSE => {
+                                Ok(punch_hole_response::Failure::LICENSE_OVERUSE) => {
                                     bail!("Key overuse");
                                 }
+                                _ => bail!("other punch hole failure"),
                             }
                         } else {
                             peer_nat_type = ph.nat_type();
@@ -353,15 +387,8 @@ impl Client {
                             my_addr.is_ipv4(),
                         )
                         .await?;
-                        let pk = Self::secure_connection(
-                            peer,
-                            signed_id_pk,
-                            key,
-                            &mut conn,
-                            false,
-                            interface,
-                        )
-                        .await?;
+                        let pk =
+                            Self::secure_connection(peer, signed_id_pk, key, &mut conn).await?;
                         return Ok((conn, false, pk));
                     }
                     _ => {
@@ -421,7 +448,7 @@ impl Client {
         conn_type: ConnType,
         interface: impl Interface,
     ) -> ResultType<(Stream, bool, Option<Vec<u8>>)> {
-        let direct_failures = PeerConfig::load(peer_id).direct_failures;
+        let direct_failures = interface.get_lch().read().unwrap().direct_failures;
         let mut connect_timeout = 0;
         const MIN: u64 = 1000;
         if is_local || peer_nat_type == NatType::SYMMETRIC {
@@ -459,6 +486,7 @@ impl Client {
         let mut conn =
             socket_client::connect_tcp_local(peer, Some(local_addr), connect_timeout).await;
         let mut direct = !conn.is_err();
+        interface.update_direct(Some(direct));
         if interface.is_force_relay() || conn.is_err() {
             if !relay_server.is_empty() {
                 conn = Self::request_relay(
@@ -471,11 +499,9 @@ impl Client {
                     conn_type,
                 )
                 .await;
-                if conn.is_err() {
-                    bail!(
-                        "Failed to connect via relay server: {}",
-                        conn.err().unwrap()
-                    );
+                interface.update_direct(Some(false));
+                if let Err(e) = conn {
+                    bail!("Failed to connect via relay server: {}", e);
                 }
                 direct = false;
             } else {
@@ -483,15 +509,13 @@ impl Client {
             }
         }
         if !relay_server.is_empty() && (direct_failures == 0) != direct {
-            let mut config = PeerConfig::load(peer_id);
-            config.direct_failures = if direct { 0 } else { 1 };
-            log::info!("direct_failures updated to {}", config.direct_failures);
-            config.store(peer_id);
+            let n = if direct { 0 } else { 1 };
+            log::info!("direct_failures updated to {}", n);
+            interface.get_lch().write().unwrap().set_direct_failure(n);
         }
         let mut conn = conn?;
         log::info!("{:?} used to establish connection", start.elapsed());
-        let pk = Self::secure_connection(peer_id, signed_id_pk, key, &mut conn, direct, interface)
-            .await?;
+        let pk = Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await?;
         Ok((conn, direct, pk))
     }
 
@@ -501,8 +525,6 @@ impl Client {
         signed_id_pk: Vec<u8>,
         key: &str,
         conn: &mut Stream,
-        direct: bool,
-        interface: impl Interface,
     ) -> ResultType<Option<Vec<u8>>> {
         let rs_pk = get_rs_pk(if key.is_empty() {
             hbb_common::config::RS_PUB_KEY
@@ -511,11 +533,13 @@ impl Client {
         });
         let mut sign_pk = None;
         let mut option_pk = None;
-        if !signed_id_pk.is_empty() && rs_pk.is_some() {
-            if let Ok((id, pk)) = decode_id_pk(&signed_id_pk, &rs_pk.unwrap()) {
-                if id == peer_id {
-                    sign_pk = Some(sign::PublicKey(pk));
-                    option_pk = Some(pk.to_vec());
+        if !signed_id_pk.is_empty() {
+            if let Some(rs_pk) = rs_pk {
+                if let Ok((id, pk)) = decode_id_pk(&signed_id_pk, &rs_pk) {
+                    if id == peer_id {
+                        sign_pk = Some(sign::PublicKey(pk));
+                        option_pk = Some(pk.to_vec());
+                    }
                 }
             }
             if sign_pk.is_none() {
@@ -532,13 +556,7 @@ impl Client {
         };
         match timeout(READ_TIMEOUT, conn.next()).await? {
             Some(res) => {
-                let bytes = match res {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        interface.set_force_relay(direct, false);
-                        bail!("{}", err);
-                    }
-                };
+                let bytes = res?;
                 if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
                     if let Some(message::Union::SignedId(si)) = msg_in.union {
                         if let Ok((id, their_pk_b)) = decode_id_pk(&si.id, &sign_pk) {
@@ -593,11 +611,17 @@ impl Client {
         let mut succeed = false;
         let mut uuid = "".to_owned();
         let mut ipv4 = true;
+
         for i in 1..=3 {
-            // use different socket due to current hbbs implement requiring different nat address for each attempt
+            // use different socket due to current hbbs implementation requiring different nat address for each attempt
             let mut socket = socket_client::connect_tcp(rendezvous_server, CONNECT_TIMEOUT)
                 .await
                 .with_context(|| "Failed to connect to rendezvous server")?;
+
+            if !key.is_empty() && !token.is_empty() {
+                // mainly for the security of token
+                allow_err!(secure_punch_connection(&mut socket, key).await);
+            }
 
             ipv4 = socket.local_addr().is_ipv4();
             let mut msg_out = RendezvousMessage::new();
@@ -619,15 +643,16 @@ impl Client {
                 ..Default::default()
             });
             socket.send(&msg_out).await?;
-            if let Some(Ok(bytes)) = socket.next_timeout(CONNECT_TIMEOUT).await {
-                if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
-                    if let Some(rendezvous_message::Union::RelayResponse(rs)) = msg_in.union {
-                        if !rs.refuse_reason.is_empty() {
-                            bail!(rs.refuse_reason);
-                        }
-                        succeed = true;
-                        break;
+
+            if let Some(msg_in) =
+                crate::get_next_nonkeyexchange_msg(&mut socket, Some(CONNECT_TIMEOUT)).await
+            {
+                if let Some(rendezvous_message::Union::RelayResponse(rs)) = msg_in.union {
+                    if !rs.refuse_reason.is_empty() {
+                        bail!(rs.refuse_reason);
                     }
+                    succeed = true;
+                    break;
                 }
             }
         }
@@ -647,7 +672,7 @@ impl Client {
         ipv4: bool,
     ) -> ResultType<Stream> {
         let mut conn = socket_client::connect_tcp(
-            socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
+            socket_client::ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
             CONNECT_TIMEOUT,
         )
         .await
@@ -674,7 +699,10 @@ impl Client {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn try_stop_clipboard(_self_id: &str) {
         #[cfg(feature = "flutter")]
-        if crate::flutter::other_sessions_running(_self_id) {
+        if crate::flutter::sessions::other_sessions_running(
+            _self_id.to_string(),
+            ConnType::DEFAULT_CONN,
+        ) {
             return;
         }
         TEXT_CLIPBOARD_STATE.lock().unwrap().running = false;
@@ -995,25 +1023,34 @@ pub struct VideoHandler {
     pub rgb: ImageRgb,
     recorder: Arc<Mutex<Option<Recorder>>>,
     record: bool,
+    _display: usize, // useful for debug
 }
 
 impl VideoHandler {
     /// Create a new video handler.
-    pub fn new() -> Self {
+    pub fn new(_display: usize) -> Self {
+        log::info!("new video handler for display #{_display}");
         VideoHandler {
             decoder: Decoder::new(),
             rgb: ImageRgb::new(ImageFormat::ARGB, crate::DST_STRIDE_RGBA),
             recorder: Default::default(),
             record: false,
+            _display,
         }
     }
 
     /// Handle a new video frame.
     #[inline]
-    pub fn handle_frame(&mut self, vf: VideoFrame) -> ResultType<bool> {
+    pub fn handle_frame(
+        &mut self,
+        vf: VideoFrame,
+        chroma: &mut Option<Chroma>,
+    ) -> ResultType<bool> {
         match &vf.union {
             Some(frame) => {
-                let res = self.decoder.handle_video_frame(frame, &mut self.rgb);
+                let res = self
+                    .decoder
+                    .handle_video_frame(frame, &mut self.rgb, chroma);
                 if self.record {
                     self.recorder
                         .lock()
@@ -1066,17 +1103,17 @@ pub struct LoginConfigHandler {
     config: PeerConfig,
     pub port_forward: (String, i32),
     pub version: i64,
-    pub conn_id: i32,
     features: Option<Features>,
-    session_id: u64,
+    pub session_id: u64, // used for local <-> server communication
     pub supported_encoding: SupportedEncoding,
     pub restarting_remote_device: bool,
     pub force_relay: bool,
     pub direct: Option<bool>,
     pub received: bool,
     switch_uuid: Option<String>,
-    pub success_time: Option<hbb_common::tokio::time::Instant>,
-    pub direct_error_counter: usize,
+    pub save_ab_password_to_recent: bool, // true: connected with ab password
+    pub other_server: Option<(String, String, String)>,
+    pub custom_fps: Arc<Mutex<Option<usize>>>,
 }
 
 impl Deref for LoginConfigHandler {
@@ -1085,16 +1122,6 @@ impl Deref for LoginConfigHandler {
     fn deref(&self) -> &Self::Target {
         &self.config
     }
-}
-
-/// Load [`PeerConfig`] from id.
-///
-/// # Arguments
-///
-/// * `id` - id of peer
-#[inline]
-pub fn load_config(id: &str) -> PeerConfig {
-    PeerConfig::load(id)
 }
 
 impl LoginConfigHandler {
@@ -1109,22 +1136,68 @@ impl LoginConfigHandler {
         id: String,
         conn_type: ConnType,
         switch_uuid: Option<String>,
-        force_relay: bool,
+        mut force_relay: bool,
     ) {
+        let mut id = id;
+        if id.contains("@") {
+            let mut v = id.split("@");
+            let raw_id: &str = v.next().unwrap_or_default();
+            let mut server_key = v.next().unwrap_or_default().split('?');
+            let server = server_key.next().unwrap_or_default();
+            let args = server_key.next().unwrap_or_default();
+            let key = if server == PUBLIC_SERVER {
+                PUBLIC_RS_PUB_KEY
+            } else {
+                let mut args_map: HashMap<&str, &str> = HashMap::new();
+                for arg in args.split('&') {
+                    if let Some(kv) = arg.find('=') {
+                        let k = &arg[0..kv];
+                        let v = &arg[kv + 1..];
+                        args_map.insert(k, v);
+                    }
+                }
+                let key = args_map.remove("key").unwrap_or_default();
+                key
+            };
+
+            // here we can check <id>/r@server
+            let real_id = crate::ui_interface::handle_relay_id(raw_id).to_string();
+            if real_id != raw_id {
+                force_relay = true;
+            }
+            self.other_server = Some((real_id.clone(), server.to_owned(), key.to_owned()));
+            id = format!("{real_id}@{server}");
+        } else {
+            let real_id = crate::ui_interface::handle_relay_id(&id);
+            if real_id != id {
+                force_relay = true;
+                id = real_id.to_owned();
+            }
+        }
+
         self.id = id;
         self.conn_type = conn_type;
         let config = self.load_config();
         self.remember = !config.password.is_empty();
         self.config = config;
-        self.session_id = rand::random();
+        let mut sid = rand::random();
+        if sid == 0 {
+            // you won the lottery
+            sid = 1;
+        }
+        self.session_id = sid;
         self.supported_encoding = Default::default();
         self.restarting_remote_device = false;
         self.force_relay = !self.get_option("force-always-relay").is_empty() || force_relay;
+        if let Some((real_id, server, key)) = &self.other_server {
+            let other_server_key = self.get_option("other-server-key");
+            if !other_server_key.is_empty() && key.is_empty() {
+                self.other_server = Some((real_id.to_owned(), server.to_owned(), other_server_key));
+            }
+        }
         self.direct = None;
         self.received = false;
         self.switch_uuid = switch_uuid;
-        self.success_time = None;
-        self.direct_error_counter = 0;
     }
 
     /// Check if the client should auto login.
@@ -1141,8 +1214,9 @@ impl LoginConfigHandler {
     }
 
     /// Load [`PeerConfig`].
-    fn load_config(&self) -> PeerConfig {
-        load_config(&self.id)
+    pub fn load_config(&self) -> PeerConfig {
+        debug_assert!(self.id.len() > 0);
+        PeerConfig::load(&self.id)
     }
 
     /// Save a [`PeerConfig`] into the handler.
@@ -1191,6 +1265,39 @@ impl LoginConfigHandler {
         self.save_config(config);
     }
 
+    /// Save reverse mouse wheel ("", "Y") to the current config.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The reverse mouse wheel ("", "Y").
+    pub fn save_reverse_mouse_wheel(&mut self, value: String) {
+        let mut config = self.load_config();
+        config.reverse_mouse_wheel = value;
+        self.save_config(config);
+    }
+
+    /// Save "displays_as_individual_windows" ("", "Y") to the current config.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The "displays_as_individual_windows" value ("", "Y").
+    pub fn save_displays_as_individual_windows(&mut self, value: String) {
+        let mut config = self.load_config();
+        config.displays_as_individual_windows = value;
+        self.save_config(config);
+    }
+
+    /// Save "use_all_my_displays_for_the_remote_session" ("", "Y") to the current config.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The "use_all_my_displays_for_the_remote_session" value ("", "Y").
+    pub fn save_use_all_my_displays_for_the_remote_session(&mut self, value: String) {
+        let mut config = self.load_config();
+        config.use_all_my_displays_for_the_remote_session = value;
+        self.save_config(config);
+    }
+
     /// Save scroll style to the current config.
     ///
     /// # Arguments
@@ -1210,7 +1317,17 @@ impl LoginConfigHandler {
     /// * `v` - value of option
     pub fn save_ui_flutter(&mut self, k: String, v: String) {
         let mut config = self.load_config();
-        config.ui_flutter.insert(k, v);
+        if v.is_empty() {
+            config.ui_flutter.remove(&k);
+        } else {
+            config.ui_flutter.insert(k, v);
+        }
+        self.save_config(config);
+    }
+
+    pub fn set_direct_failure(&mut self, value: i32) {
+        let mut config = self.load_config();
+        config.direct_failures = value;
         self.save_config(config);
     }
 
@@ -1366,16 +1483,27 @@ impl LoginConfigHandler {
             msg.image_quality = q.into();
             n += 1;
         } else if q == "custom" {
-            let config = PeerConfig::load(&self.id);
+            let config = self.load_config();
+            let allow_more =
+                !crate::ui_interface::using_public_server() || self.direct == Some(true);
             let quality = if config.custom_image_quality.is_empty() {
                 50
             } else {
-                config.custom_image_quality[0]
+                let mut quality = config.custom_image_quality[0];
+                if !allow_more && quality > 100 {
+                    quality = 50;
+                }
+                quality
             };
             msg.custom_image_quality = quality << 8;
             #[cfg(feature = "flutter")]
             if let Some(custom_fps) = self.options.get("custom-fps") {
-                msg.custom_fps = custom_fps.parse().unwrap_or(30);
+                let mut custom_fps = custom_fps.parse().unwrap_or(30);
+                if !allow_more && custom_fps > 30 {
+                    custom_fps = 30;
+                }
+                msg.custom_fps = custom_fps;
+                *self.custom_fps.lock().unwrap() = Some(custom_fps as _);
             }
             n += 1;
         }
@@ -1504,6 +1632,15 @@ impl LoginConfigHandler {
         msg_out
     }
 
+    /// Create a [`Message`] for refreshing video.
+    pub fn refresh_display(display: usize) -> Message {
+        let mut misc = Misc::new();
+        misc.set_refresh_video_display(display as _);
+        let mut msg_out = Message::new();
+        msg_out.set_misc(misc);
+        msg_out
+    }
+
     /// Create a [`Message`] for saving custom image quality.
     ///
     /// # Arguments
@@ -1553,7 +1690,8 @@ impl LoginConfigHandler {
     /// # Arguments
     ///
     /// * `fps` - The given fps.
-    pub fn set_custom_fps(&mut self, fps: i32) -> Message {
+    /// * `save_config` - Save the config.
+    pub fn set_custom_fps(&mut self, fps: i32, save_config: bool) -> Message {
         let mut misc = Misc::new();
         misc.set_option(OptionMessage {
             custom_fps: fps,
@@ -1561,11 +1699,14 @@ impl LoginConfigHandler {
         });
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
-        let mut config = self.load_config();
-        config
-            .options
-            .insert("custom-fps".to_owned(), fps.to_string());
-        self.save_config(config);
+        if save_config {
+            let mut config = self.load_config();
+            config
+                .options
+                .insert("custom-fps".to_owned(), fps.to_string());
+            self.save_config(config);
+        }
+        *self.custom_fps.lock().unwrap() = Some(fps as _);
         msg_out
     }
 
@@ -1643,26 +1784,56 @@ impl LoginConfigHandler {
                 log::debug!("remember password of {}", self.id);
             }
         } else {
-            if !password0.is_empty() {
+            if self.save_ab_password_to_recent {
+                config.password = password;
+                log::debug!("save ab password of {} to recent", self.id);
+            } else if !password0.is_empty() {
                 config.password = Default::default();
                 log::debug!("remove password of {}", self.id);
             }
         }
+        if let Some((_, b, c)) = self.other_server.as_ref() {
+            if b != PUBLIC_SERVER {
+                config
+                    .options
+                    .insert("other-server-key".to_owned(), c.clone());
+            }
+        }
+        if self.force_relay {
+            config
+                .options
+                .insert("force-always-relay".to_owned(), "Y".to_owned());
+        }
+        #[cfg(feature = "flutter")]
+        {
+            // sync ab password with PeerConfig password
+            let password = base64::encode(config.password.clone(), base64::Variant::Original);
+            let evt: HashMap<&str, String> = HashMap::from([
+                ("name", "sync_peer_password_to_ab".to_string()),
+                ("id", self.id.clone()),
+                ("password", password),
+            ]);
+            let evt = serde_json::ser::to_string(&evt).unwrap_or("".to_owned());
+            crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, evt);
+        }
         if config.keyboard_mode.is_empty() {
-            if is_keyboard_mode_supported(&KeyboardMode::Map, get_version_number(&pi.version)) {
+            if is_keyboard_mode_supported(
+                &KeyboardMode::Map,
+                get_version_number(&pi.version),
+                &pi.platform,
+            ) {
                 config.keyboard_mode = KeyboardMode::Map.to_string();
             } else {
                 config.keyboard_mode = KeyboardMode::Legacy.to_string();
             }
         } else {
             let keyboard_modes =
-                common::get_supported_keyboard_modes(get_version_number(&pi.version));
+                crate::get_supported_keyboard_modes(get_version_number(&pi.version), &pi.platform);
             let current_mode = &KeyboardMode::from_str(&config.keyboard_mode).unwrap_or_default();
             if !keyboard_modes.contains(current_mode) {
                 config.keyboard_mode = KeyboardMode::Legacy.to_string();
             }
         }
-        self.conn_id = pi.conn_id;
         // no matter if change, for update file time
         self.save_config(config);
         self.supported_encoding = pi.encoding.clone().unwrap_or_default();
@@ -1695,11 +1866,17 @@ impl LoginConfigHandler {
         password: Vec<u8>,
     ) -> Message {
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        let my_id = Config::get_id_or(crate::common::DEVICE_ID.lock().unwrap().clone());
+        let my_id = Config::get_id_or(crate::DEVICE_ID.lock().unwrap().clone());
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let my_id = Config::get_id();
+        let (my_id, pure_id) = if let Some((id, _, _)) = self.other_server.as_ref() {
+            let server = Config::get_rendezvous_server();
+            (format!("{my_id}@{server}"), id.clone())
+        } else {
+            (my_id, self.id.clone())
+        };
         let mut lr = LoginRequest {
-            username: self.id.clone(),
+            username: pure_id,
             password: password.into(),
             my_id,
             my_name: crate::username(),
@@ -1752,31 +1929,26 @@ impl LoginConfigHandler {
         msg_out.set_misc(misc);
         msg_out
     }
-
-    pub fn set_force_relay(&mut self, direct: bool, received: bool) {
-        self.force_relay = false;
-        if direct && !received {
-            let errno = errno::errno().0;
-            // TODO: check mac and ios
-            if cfg!(windows) && errno == 10054 || !cfg!(windows) && errno == 104 {
-                self.force_relay = true;
-                self.set_option("force-always-relay".to_owned(), "Y".to_owned());
-            }
-        }
-    }
 }
 
 /// Media data.
 pub enum MediaData {
-    VideoQueue,
+    VideoQueue(usize),
     VideoFrame(Box<VideoFrame>),
     AudioFrame(Box<AudioFrame>),
     AudioFormat(AudioFormat),
-    Reset,
-    RecordScreen(bool, i32, i32, String),
+    Reset(usize),
+    RecordScreen(bool, usize, i32, i32, String),
 }
 
 pub type MediaSender = mpsc::Sender<MediaData>;
+
+struct VideoHandlerController {
+    handler: VideoHandler,
+    count: u128,
+    duration: std::time::Duration,
+    skip_beginning: u32,
+}
 
 /// Start video and audio thread.
 /// Return two [`MediaSender`], they should be given to the media producer.
@@ -1784,71 +1956,147 @@ pub type MediaSender = mpsc::Sender<MediaData>;
 /// # Arguments
 ///
 /// * `video_callback` - The callback for video frame. Being called when a video frame is ready.
-pub fn start_video_audio_threads<F>(
+pub fn start_video_audio_threads<F, T>(
+    session: Session<T>,
     video_callback: F,
 ) -> (
     MediaSender,
     MediaSender,
-    Arc<ArrayQueue<VideoFrame>>,
-    Arc<AtomicUsize>,
+    Arc<RwLock<HashMap<usize, ArrayQueue<VideoFrame>>>>,
+    Arc<RwLock<HashMap<usize, usize>>>,
+    Arc<RwLock<Option<Chroma>>>,
 )
 where
-    F: 'static + FnMut(&mut scrap::ImageRgb) + Send,
+    F: 'static + FnMut(usize, &mut scrap::ImageRgb) + Send,
+    T: InvokeUiSession,
 {
     let (video_sender, video_receiver) = mpsc::channel::<MediaData>();
-    let video_queue = Arc::new(ArrayQueue::<VideoFrame>::new(VIDEO_QUEUE_SIZE));
-    let video_queue_cloned = video_queue.clone();
+    let video_queue_map: Arc<RwLock<HashMap<usize, ArrayQueue<VideoFrame>>>> = Default::default();
+    let video_queue_map_cloned = video_queue_map.clone();
     let mut video_callback = video_callback;
-    let mut duration = std::time::Duration::ZERO;
-    let mut count = 0;
-    let fps = Arc::new(AtomicUsize::new(0));
-    let decode_fps = fps.clone();
-    let mut skip_beginning = 0;
+    let fps_map = Arc::new(RwLock::new(HashMap::new()));
+    let decode_fps_map = fps_map.clone();
+    let chroma = Arc::new(RwLock::new(None));
+    let chroma_cloned = chroma.clone();
+    let mut last_chroma = None;
 
     std::thread::spawn(move || {
-        let mut video_handler = VideoHandler::new();
+        #[cfg(windows)]
+        sync_cpu_usage();
+        let mut handler_controller_map = Vec::new();
+        // let mut count = Vec::new();
+        // let mut duration = std::time::Duration::ZERO;
+        // let mut skip_beginning = Vec::new();
         loop {
             if let Ok(data) = video_receiver.recv() {
                 match data {
-                    MediaData::VideoFrame(_) | MediaData::VideoQueue => {
-                        let vf = if let MediaData::VideoFrame(vf) = data {
-                            *vf
-                        } else {
-                            if let Some(vf) = video_queue.pop() {
-                                vf
-                            } else {
+                    MediaData::VideoFrame(_) | MediaData::VideoQueue(_) => {
+                        let vf = match data {
+                            MediaData::VideoFrame(vf) => *vf,
+                            MediaData::VideoQueue(display) => {
+                                if let Some(video_queue) =
+                                    video_queue_map.read().unwrap().get(&display)
+                                {
+                                    if let Some(vf) = video_queue.pop() {
+                                        vf
+                                    } else {
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                // unreachable!();
                                 continue;
                             }
                         };
+                        let display = vf.display as usize;
                         let start = std::time::Instant::now();
-                        if let Ok(true) = video_handler.handle_frame(vf) {
-                            video_callback(&mut video_handler.rgb);
-                            // fps calculation
-                            // The first frame will be very slow
-                            if skip_beginning < 5 {
-                                skip_beginning += 1;
-                                continue;
+                        if handler_controller_map.len() <= display {
+                            for _i in handler_controller_map.len()..=display {
+                                handler_controller_map.push(VideoHandlerController {
+                                    handler: VideoHandler::new(_i),
+                                    count: 0,
+                                    duration: std::time::Duration::ZERO,
+                                    skip_beginning: 0,
+                                });
                             }
-                            duration += start.elapsed();
-                            count += 1;
-                            if count % 10 == 0 {
-                                fps.store(
-                                    (count * 1000 / duration.as_millis()) as usize,
-                                    Ordering::Relaxed,
-                                );
-                            }
-                            // Clear to get real-time fps
-                            if count > 300 {
-                                count = 0;
-                                duration = Duration::ZERO;
+                        }
+                        if let Some(handler_controller) = handler_controller_map.get_mut(display) {
+                            let mut tmp_chroma = None;
+                            match handler_controller.handler.handle_frame(vf, &mut tmp_chroma) {
+                                Ok(true) => {
+                                    video_callback(display, &mut handler_controller.handler.rgb);
+
+                                    // chroma
+                                    if tmp_chroma.is_some() && last_chroma != tmp_chroma {
+                                        last_chroma = tmp_chroma;
+                                        *chroma.write().unwrap() = tmp_chroma;
+                                    }
+
+                                    // fps calculation
+                                    // The first frame will be very slow
+                                    if handler_controller.skip_beginning < 5 {
+                                        handler_controller.skip_beginning += 1;
+                                        continue;
+                                    }
+
+                                    handler_controller.duration += start.elapsed();
+                                    handler_controller.count += 1;
+                                    if handler_controller.count % 10 == 0 {
+                                        fps_map.write().unwrap().insert(
+                                            display,
+                                            (handler_controller.count * 1000
+                                                / handler_controller.duration.as_millis())
+                                                as usize,
+                                        );
+                                    }
+                                    // Clear to get real-time fps
+                                    if handler_controller.count > 150 {
+                                        handler_controller.count = 0;
+                                        handler_controller.duration = Duration::ZERO;
+                                    }
+                                }
+                                Err(e) => {
+                                    // This is a simple workaround.
+                                    //
+                                    // I only see the following error:
+                                    // FailedCall("errcode=1 scrap::common::vpxcodec:libs\\scrap\\src\\common\\vpxcodec.rs:433:9")
+                                    // When switching from all displays to one display, the error occurs.
+                                    // eg:
+                                    // 1. Connect to a device with two displays (A and B).
+                                    // 2. Switch to display A. The error occurs.
+                                    // 3. If the error does not occur. Switch from A to display B. The error occurs.
+                                    //
+                                    // to-do: fix the error
+                                    log::error!("handle video frame error, {}", e);
+                                    session.refresh_video(display as _);
+                                }
+                                _ => {}
                             }
                         }
                     }
-                    MediaData::Reset => {
-                        video_handler.reset();
+                    MediaData::Reset(display) => {
+                        if let Some(handler_controler) = handler_controller_map.get_mut(display) {
+                            handler_controler.handler.reset();
+                        }
                     }
-                    MediaData::RecordScreen(start, w, h, id) => {
-                        video_handler.record_screen(start, w, h, id)
+                    MediaData::RecordScreen(start, display, w, h, id) => {
+                        log::info!("record screen command: start:{start}, display:{display}");
+                        if handler_controller_map.len() == 1 {
+                            // Compatible with the sciter version(single ui session).
+                            // For the sciter version, there're no multi-ui-sessions for one connection.
+                            // The display is always 0, video_handler_controllers.len() is always 1. So we use the first video handler.
+                            handler_controller_map[0]
+                                .handler
+                                .record_screen(start, w, h, id);
+                        } else {
+                            if let Some(handler_controler) = handler_controller_map.get_mut(display)
+                            {
+                                handler_controler.handler.record_screen(start, w, h, id);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1859,7 +2107,13 @@ where
         log::info!("Video decoder loop exits");
     });
     let audio_sender = start_audio_thread();
-    return (video_sender, audio_sender, video_queue_cloned, decode_fps);
+    return (
+        video_sender,
+        audio_sender,
+        video_queue_map_cloned,
+        decode_fps_map,
+        chroma_cloned,
+    );
 }
 
 /// Start an audio thread
@@ -1889,6 +2143,39 @@ pub fn start_audio_thread() -> MediaSender {
     audio_sender
 }
 
+#[cfg(windows)]
+fn sync_cpu_usage() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let t = std::thread::spawn(do_sync_cpu_usage);
+        t.join().ok();
+    });
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+async fn do_sync_cpu_usage() {
+    use crate::ipc::{connect, Data};
+    let start = std::time::Instant::now();
+    match connect(50, "").await {
+        Ok(mut conn) => {
+            if conn.send(&&Data::SyncWinCpuUsage(None)).await.is_ok() {
+                if let Ok(Some(data)) = conn.next_timeout(50).await {
+                    match data {
+                        Data::SyncWinCpuUsage(cpu_usage) => {
+                            hbb_common::platform::windows::sync_cpu_usage(cpu_usage);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    log::info!("{:?} used to sync cpu usage", start.elapsed());
+}
+
 /// Handle latency test.
 ///
 /// # Arguments
@@ -1905,13 +2192,13 @@ pub async fn handle_test_delay(t: TestDelay, peer: &mut Stream) {
 
 /// Whether is track pad scrolling.
 #[inline]
-#[cfg(all(target_os = "macos"))]
+#[cfg(all(target_os = "macos", not(feature = "flutter")))]
 fn check_scroll_on_mac(mask: i32, x: i32, y: i32) -> bool {
     // flutter version we set mask type bit to 4 when track pad scrolling.
-    if mask & 7 == 4 {
+    if mask & 7 == crate::input::MOUSE_TYPE_TRACKPAD {
         return true;
     }
-    if mask & 3 != 3 {
+    if mask & 3 != crate::input::MOUSE_TYPE_WHEEL {
         return false;
     }
     let btn = mask >> 3;
@@ -1972,12 +2259,41 @@ pub fn send_mouse(
     if command {
         mouse_event.modifiers.push(ControlKey::Meta.into());
     }
-    #[cfg(all(target_os = "macos"))]
+    #[cfg(all(target_os = "macos", not(feature = "flutter")))]
     if check_scroll_on_mac(mask, x, y) {
-        mouse_event.modifiers.push(ControlKey::Scroll.into());
+        let factor = 3;
+        mouse_event.mask = crate::input::MOUSE_TYPE_TRACKPAD;
+        mouse_event.x *= factor;
+        mouse_event.y *= factor;
     }
     interface.swap_modifier_mouse(&mut mouse_event);
     msg_out.set_mouse_event(mouse_event);
+    interface.send(Data::Message(msg_out));
+}
+
+#[inline]
+pub fn send_pointer_device_event(
+    mut evt: PointerDeviceEvent,
+    alt: bool,
+    ctrl: bool,
+    shift: bool,
+    command: bool,
+    interface: &impl Interface,
+) {
+    let mut msg_out = Message::new();
+    if alt {
+        evt.modifiers.push(ControlKey::Alt.into());
+    }
+    if shift {
+        evt.modifiers.push(ControlKey::Shift.into());
+    }
+    if ctrl {
+        evt.modifiers.push(ControlKey::Control.into());
+    }
+    if command {
+        evt.modifiers.push(ControlKey::Meta.into());
+    }
+    msg_out.set_pointer_device_event(evt);
     interface.send(Data::Message(msg_out));
 }
 
@@ -1986,13 +2302,25 @@ pub fn send_mouse(
 /// # Arguments
 ///
 /// * `interface` - The interface for sending data.
-fn activate_os(interface: &impl Interface) {
+/// * `send_left_click` - Whether to send a click event.
+fn activate_os(interface: &impl Interface, send_left_click: bool) {
+    let left_down = MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_DOWN;
+    let left_up = MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_UP;
+    let right_down = MOUSE_BUTTON_RIGHT << 3 | MOUSE_TYPE_DOWN;
+    let right_up = MOUSE_BUTTON_RIGHT << 3 | MOUSE_TYPE_UP;
+    send_mouse(left_up, 0, 0, false, false, false, false, interface);
+    std::thread::sleep(Duration::from_millis(50));
     send_mouse(0, 0, 0, false, false, false, false, interface);
     std::thread::sleep(Duration::from_millis(50));
     send_mouse(0, 3, 3, false, false, false, false, interface);
+    let (click_down, click_up) = if send_left_click {
+        (left_down, left_up)
+    } else {
+        (right_down, right_up)
+    };
     std::thread::sleep(Duration::from_millis(50));
-    send_mouse(1 | 1 << 3, 0, 0, false, false, false, false, interface);
-    send_mouse(2 | 1 << 3, 0, 0, false, false, false, false, interface);
+    send_mouse(click_down, 0, 0, false, false, false, false, interface);
+    send_mouse(click_up, 0, 0, false, false, false, false, interface);
     /*
     let mut key_event = KeyEvent::new();
     // do not use Esc, which has problem with Linux
@@ -2025,9 +2353,14 @@ pub fn input_os_password(p: String, activate: bool, interface: impl Interface) {
 /// * `activate` - Whether to activate OS.
 /// * `interface` - The interface for sending data.
 fn _input_os_password(p: String, activate: bool, interface: impl Interface) {
+    let input_password = !p.is_empty();
     if activate {
-        activate_os(&interface);
+        // Click event is used to bring up the password input box.
+        activate_os(&interface, input_password);
         std::thread::sleep(Duration::from_millis(1200));
+    }
+    if !input_password {
+        return;
     }
     let mut key_event = KeyEvent::new();
     key_event.press = true;
@@ -2052,7 +2385,13 @@ struct LoginErrorMsgBox {
 lazy_static::lazy_static! {
     static ref LOGIN_ERROR_MAP: Arc<HashMap<&'static str, LoginErrorMsgBox>> = {
         use hbb_common::config::LINK_HEADLESS_LINUX_SUPPORT;
-        let map = HashMap::from([(LOGIN_MSG_DESKTOP_SESSION_NOT_READY, LoginErrorMsgBox{
+        let map = HashMap::from([(LOGIN_SCREEN_WAYLAND, LoginErrorMsgBox{
+            msgtype: "error",
+            title: "Login Error",
+            text: "Login screen using Wayland is not supported",
+            link: "https://rustdesk.com/docs/en/manual/linux/#login-screen",
+            try_again: true,
+        }), (LOGIN_MSG_DESKTOP_SESSION_NOT_READY, LoginErrorMsgBox{
             msgtype: "session-login",
             title: "",
             text: "",
@@ -2112,6 +2451,7 @@ pub fn handle_login_error(
     err: &str,
     interface: &impl Interface,
 ) -> bool {
+    lc.write().unwrap().save_ab_password_to_recent = false;
     if err == LOGIN_MSG_PASSWORD_EMPTY {
         lc.write().unwrap().password = Default::default();
         interface.msgbox("input-password", "Password Required", "", "");
@@ -2180,6 +2520,26 @@ pub async fn handle_hash(
     if password.is_empty() {
         password = lc.read().unwrap().config.password.clone();
     }
+    if password.is_empty() {
+        let access_token = LocalConfig::get_option("access_token");
+        let ab = hbb_common::config::Ab::load();
+        if !access_token.is_empty() && access_token == ab.access_token {
+            let id = lc.read().unwrap().id.clone();
+            if let Some(p) = ab
+                .peers
+                .iter()
+                .find_map(|p| if p.id == id { Some(p) } else { None })
+            {
+                if let Ok(hash) = base64::decode(p.hash.clone(), base64::Variant::Original) {
+                    if !hash.is_empty() {
+                        password = hash;
+                        lc.write().unwrap().save_ab_password_to_recent = true;
+                    }
+                }
+            }
+        }
+    }
+    lc.write().unwrap().password = password.clone();
     let password = if password.is_empty() {
         // login without password, the remote side can click accept
         interface.msgbox("input-password", "Password Required", "", "");
@@ -2251,9 +2611,9 @@ pub async fn handle_login_from_ui(
         hasher.update(&lc.read().unwrap().hash.salt);
         let res = hasher.finalize();
         lc.write().unwrap().remember = remember;
-        lc.write().unwrap().password = res[..].into();
         res[..].into()
     };
+    lc.write().unwrap().password = hash_password.clone();
     let mut hasher2 = Sha256::new();
     hasher2.update(&hash_password[..]);
     hasher2.update(&lc.read().unwrap().hash.challenge);
@@ -2288,33 +2648,71 @@ pub trait Interface: Send + Clone + 'static + Sized {
     /// Send message data to remote peer.
     fn send(&self, data: Data);
     fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str);
-    fn handle_login_error(&mut self, err: &str) -> bool;
-    fn handle_peer_info(&mut self, pi: PeerInfo);
+    fn handle_login_error(&self, err: &str) -> bool;
+    fn handle_peer_info(&self, pi: PeerInfo);
     fn on_error(&self, err: &str) {
         self.msgbox("error", "Error", err, "");
     }
-    async fn handle_hash(&mut self, pass: &str, hash: Hash, peer: &mut Stream);
+    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut Stream);
     async fn handle_login_from_ui(
-        &mut self,
+        &self,
         os_username: String,
         os_password: String,
         password: String,
         remember: bool,
         peer: &mut Stream,
     );
-    async fn handle_test_delay(&mut self, t: TestDelay, peer: &mut Stream);
+    async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream);
 
-    fn get_login_config_handler(&self) -> Arc<RwLock<LoginConfigHandler>>;
-    fn set_force_relay(&self, direct: bool, received: bool) {
-        self.get_login_config_handler()
-            .write()
-            .unwrap()
-            .set_force_relay(direct, received);
+    fn get_lch(&self) -> Arc<RwLock<LoginConfigHandler>>;
+
+    fn get_id(&self) -> String {
+        self.get_lch().read().unwrap().id.clone()
     }
+
     fn is_force_relay(&self) -> bool {
-        self.get_login_config_handler().read().unwrap().force_relay
+        self.get_lch().read().unwrap().force_relay
     }
+
     fn swap_modifier_mouse(&self, _msg: &mut hbb_common::protos::message::MouseEvent) {}
+
+    fn update_direct(&self, direct: Option<bool>) {
+        self.get_lch().write().unwrap().direct = direct;
+    }
+
+    fn update_received(&self, received: bool) {
+        self.get_lch().write().unwrap().received = received;
+    }
+
+    fn on_establish_connection_error(&self, err: String) {
+        let title = "Connection Error";
+        let text = err.to_string();
+        let lc = self.get_lch();
+        let direct = lc.read().unwrap().direct;
+        let received = lc.read().unwrap().received;
+
+        let mut relay_hint = false;
+        let mut relay_hint_type = "relay-hint";
+        // force relay
+        let errno = errno::errno().0;
+        log::error!("Connection closed: {err}({errno})");
+        if direct == Some(true)
+            && ((cfg!(windows) && (errno == 10054 || err.contains("10054")))
+                || (!cfg!(windows) && (errno == 104 || err.contains("104"))))
+        {
+            relay_hint = true;
+            if !received {
+                relay_hint_type = "relay-hint2"
+            }
+        }
+
+        // relay-hint
+        if cfg!(feature = "flutter") && relay_hint {
+            self.msgbox(relay_hint_type, title, &text, "");
+        } else {
+            self.msgbox("error", title, &text, "");
+        }
+    }
 }
 
 /// Data used by the client interface.
@@ -2333,12 +2731,13 @@ pub enum Data {
     CancelJob(i32),
     RemovePortForward(i32),
     AddPortForward((i32, String, i32)),
+    #[cfg(not(feature = "flutter"))]
     ToggleClipboardFile,
     NewRDP,
     SetConfirmOverrideFile((i32, i32, bool, bool, bool)),
     AddJob((i32, String, String, i32, bool, bool)),
     ResumeJob((i32, bool)),
-    RecordScreen(bool, i32, i32, String),
+    RecordScreen(bool, usize, i32, i32, String),
     ElevateDirect,
     ElevateWithLogon(String, String),
     NewVoiceCall,

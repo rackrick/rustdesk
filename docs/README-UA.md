@@ -34,13 +34,7 @@ RustDesk вітає внесок кожного. Дивіться [`docs/CONTRIB
 Нижче наведені сервери, для безкоштовного використання, вони можуть змінюватися з часом. Якщо ви не перебуваєте поруч з одним із них, ваша мережа може працювати повільно.
 | Місцезнаходження | Постачальник | Технічні характеристики |
 | --------- | ------------- | ------------------ |
-| Південна Корея (Сеул) | AWS lightsail | 1 vCPU / 0.5GB RAM |
-| Сінгапур | Vultr | 1 vCPU / 1GB RAM |
-| США (Даллас) | Vultr | 1 vCPU / 1GB RAM
 | Німеччина | Hetzner | 2 VCPU / 4GB RAM |
-| Німеччина | Codext | 4 vCPU / 8GB RAM |
-| Фінляндія (Гельсінкі) | [Netlock](https://netlockendpoint.com) | 4 vCPU / 8GB RAM |
-| США (Ешберн) | [Netlock](https://netlockendpoint.com) | 4 vCPU / 8GB RAM |
 | Україна (Київ) | [dc.volia](https://dc.volia.com) | 2 vCPU / 4GB RAM |
 
 ## Dev Container
@@ -136,10 +130,6 @@ wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/lib
 mv libsciter-gtk.so target/debug
 VCPKG_ROOT=$HOME/vcpkg cargo run
 ```
-
-### Змініть Wayland на X11 (Xorg)
-
-RustDesk не підтримує Wayland. Дивіться [цей документ](https://docs.fedoraproject.org/en-US/quick-docs/configuring-xorg-as-default-gnome-session/) для налаштування Xorg як сеансу GNOME за замовчуванням.
 
 ## Як зібрати за допомогою Docker
 

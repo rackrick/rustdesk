@@ -25,11 +25,7 @@ Abaixo estão os servidores que você está utilizando de graça, ele pode mudar
 
 | Localização | Fornecedor    | Especificações     |
 | ----------- | ------------- | ------------------ |
-| Seoul | AWS lightsail | 1 vCPU / 0.5GB RAM |
 | Germany | Hetzner | 2 vCPU / 4GB RAM |
-| Germany | Codext | 4 vCPU / 8GB RAM |
-| Finland (Helsinki) | 0x101 Cyber Security | 4 vCPU / 8GB RAM |
-| USA (Ashburn) | 0x101 Cyber Security | 4 vCPU / 8GB RAM |
 
 ## Dependências
 
@@ -107,10 +103,6 @@ wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/lib
 mv libsciter-gtk.so target/debug
 VCPKG_ROOT=$HOME/vcpkg cargo run
 ```
-
-### Mude Wayland para X11 (Xorg)
-
-RustDesk não suporta Wayland. Veja [esse link](https://docs.fedoraproject.org/pt_BR/quick-docs/configuring-xorg-as-default-gnome-session/) para configurar o Xorg como a sessão padrão do GNOME.
 
 ## Como compilar com Docker
 

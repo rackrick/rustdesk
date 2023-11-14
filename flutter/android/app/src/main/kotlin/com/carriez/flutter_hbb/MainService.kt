@@ -44,7 +44,6 @@ import java.nio.ByteBuffer
 import kotlin.math.max
 import kotlin.math.min
 
-
 const val DEFAULT_NOTIFY_TITLE = "RustDesk"
 const val DEFAULT_NOTIFY_TEXT = "Service is running"
 const val DEFAULT_NOTIFY_ID = 1
@@ -71,18 +70,33 @@ class MainService : Service() {
 
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
-    fun rustMouseInput(mask: Int, x: Int, y: Int) {
+    fun rustPointerInput(kind: String, mask: Int, x: Int, y: Int) {
         // turn on screen with LIFT_DOWN when screen off
-        if (!powerManager.isInteractive && mask == LIFT_DOWN) {
+        if (!powerManager.isInteractive && (kind == "touch" || mask == LIFT_DOWN)) {
             if (wakeLock.isHeld) {
-                Log.d(logTag,"Turn on Screen, WakeLock release")
+                Log.d(logTag, "Turn on Screen, WakeLock release")
                 wakeLock.release()
             }
             Log.d(logTag,"Turn on Screen")
             wakeLock.acquire(5000)
         } else {
-            InputService.ctx?.onMouseInput(mask,x,y)
+            when (kind) {
+                "touch" -> {
+                    InputService.ctx?.onTouchInput(mask, x, y)
+                }
+                "mouse" -> {
+                    InputService.ctx?.onMouseInput(mask, x, y)
+                }
+                else -> {
+                }
+            }
         }
+    }
+
+    @Keep
+    @RequiresApi(Build.VERSION_CODES.N)
+    fun rustKeyEventInput(input: ByteArray) {
+        InputService.ctx?.onKeyEvent(input)
     }
 
     @Keep

@@ -34,11 +34,7 @@ RustDesk heißt jegliche Mitarbeit willkommen. Schauen Sie sich [CONTRIBUTING-DE
 Nachfolgend sind die Server gelistet, die Sie kostenlos nutzen können. Es kann sein, dass sich diese Liste immer mal wieder ändert. Falls Sie nicht in der Nähe einer dieser Server sind, kann es sein, dass Ihre Verbindung langsam sein wird.
 | Standort | Anbieter | Spezifikation |
 | --------- | ------------- | ------------------ |
-| Südkorea (Seoul) | [AWS lightsail](https://aws.amazon.com/de/) | 1 vCPU / 0,5 GB RAM |
 | Deutschland | [Hetzner](https://www.hetzner.com/de/) | 2 vCPU / 4 GB RAM |
-| Deutschland | [Codext](https://codext.de/) | 4 vCPU / 8 GB RAM |
-| Finnland (Helsinki) | [Netlock](https://netlockendpoint.com/de/index.html) | 4 vCPU / 8 GB RAM |
-| USA (Ashburn) | [Netlock](https://netlockendpoint.com/de/index.html) | 4 vCPU / 8 GB RAM |
 | Ukraine (Kiew) | [dc.volia](https://dc.volia.com) | 2 vCPU / 4 GB RAM |
 
 ## Dev-Container
@@ -135,34 +131,6 @@ mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
 VCPKG_ROOT=$HOME/vcpkg cargo run
-```
-
-### Wayland zu X11 (Xorg) ändern
-
-RustDesk unterstützt Wayland nicht. Siehe [hier](https://docs.fedoraproject.org/en-US/quick-docs/configuring-xorg-as-default-gnome-session/), um Xorg als Standard-GNOME-Sitzung zu nutzen.
-
-## Wayland-Unterstützung
-
-Wayland scheint keine API für das Senden von Tastatureingaben an andere Fenster zu bieten. Daher verwendet RustDesk eine API von einer niedrigeren Ebene, nämlich dem Gerät `/dev/uinput` (Linux-Kernelebene).
-
-Wenn Wayland die kontrollierte Seite ist, müssen Sie wie folgt vorgehen:
-```bash
-# Dienst uinput starten
-$ sudo rustdesk --service
-$ rustdesk
-```
-**Hinweis**: Die Wayland-Bildschirmaufnahme verwendet verschiedene Schnittstellen. RustDesk unterstützt derzeit nur org.freedesktop.portal.ScreenCast.
-```bash
-$ dbus-send --session --print-reply       \
-  --dest=org.freedesktop.portal.Desktop \
-  /org/freedesktop/portal/desktop       \
-  org.freedesktop.DBus.Properties.Get   \
-  string:org.freedesktop.portal.ScreenCast string:version
-# Keine Unterstützung
-Error org.freedesktop.DBus.Error.InvalidArgs: No such interface “org.freedesktop.portal.ScreenCast”
-# Unterstützung
-method return time=1662544486.931020 sender=:1.54 -> destination=:1.139 serial=257 reply_serial=2
-   variant       uint32 4
 ```
 
 ## Auf Docker kompilieren

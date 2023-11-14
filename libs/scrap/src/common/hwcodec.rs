@@ -1,6 +1,6 @@
 use crate::{
-    codec::{EncoderApi, EncoderCfg},
-    hw, ImageFormat, ImageRgb, HW_STRIDE_ALIGN,
+    codec::{base_bitrate, codec_thread_num, EncoderApi, EncoderCfg},
+    hw, ImageFormat, ImageRgb, Pixfmt, HW_STRIDE_ALIGN,
 };
 use hbb_common::{
     allow_err,
@@ -8,7 +8,7 @@ use hbb_common::{
     bytes::Bytes,
     config::HwCodecConfig,
     log,
-    message_proto::{EncodedVideoFrame, EncodedVideoFrames, Message, VideoFrame},
+    message_proto::{EncodedVideoFrame, EncodedVideoFrames, VideoFrame},
     ResultType,
 };
 use hwcodec::{
@@ -31,29 +31,39 @@ const DEFAULT_RC: RateControl = RC_DEFAULT;
 
 pub struct HwEncoder {
     encoder: Encoder,
-    yuv: Vec<u8>,
     pub format: DataFormat,
     pub pixfmt: AVPixelFormat,
+    width: u32,
+    height: u32,
+    bitrate: u32, //kbs
 }
 
 impl EncoderApi for HwEncoder {
-    fn new(cfg: EncoderCfg) -> ResultType<Self>
+    fn new(cfg: EncoderCfg, _i444: bool) -> ResultType<Self>
     where
         Self: Sized,
     {
         match cfg {
             EncoderCfg::HW(config) => {
+                let b = Self::convert_quality(config.quality);
+                let base_bitrate = base_bitrate(config.width as _, config.height as _);
+                let mut bitrate = base_bitrate * b / 100;
+                if base_bitrate <= 0 {
+                    bitrate = base_bitrate;
+                }
+                let gop = config.keyframe_interval.unwrap_or(DEFAULT_GOP as _) as i32;
                 let ctx = EncodeContext {
                     name: config.name.clone(),
                     width: config.width as _,
                     height: config.height as _,
                     pixfmt: DEFAULT_PIXFMT,
                     align: HW_STRIDE_ALIGN as _,
-                    bitrate: config.bitrate * 1000,
+                    bitrate: bitrate as i32 * 1000,
                     timebase: DEFAULT_TIME_BASE,
-                    gop: DEFAULT_GOP,
+                    gop,
                     quality: DEFAULT_HW_QUALITY,
                     rc: DEFAULT_RC,
+                    thread_count: codec_thread_num() as _, // ffmpeg's thread_count is used for cpu
                 };
                 let format = match Encoder::format_from_name(config.name.clone()) {
                     Ok(format) => format,
@@ -67,9 +77,11 @@ impl EncoderApi for HwEncoder {
                 match Encoder::new(ctx.clone()) {
                     Ok(encoder) => Ok(HwEncoder {
                         encoder,
-                        yuv: vec![],
                         format,
                         pixfmt: ctx.pixfmt,
+                        width: ctx.width as _,
+                        height: ctx.height as _,
+                        bitrate,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -78,12 +90,7 @@ impl EncoderApi for HwEncoder {
         }
     }
 
-    fn encode_to_message(
-        &mut self,
-        frame: &[u8],
-        _ms: i64,
-    ) -> ResultType<hbb_common::message_proto::Message> {
-        let mut msg_out = Message::new();
+    fn encode_to_message(&mut self, frame: &[u8], _ms: i64) -> ResultType<VideoFrame> {
         let mut vf = VideoFrame::new();
         let mut frames = Vec::new();
         for frame in self.encode(frame).with_context(|| "Failed to encode")? {
@@ -103,20 +110,51 @@ impl EncoderApi for HwEncoder {
                 DataFormat::H264 => vf.set_h264s(frames),
                 DataFormat::H265 => vf.set_h265s(frames),
             }
-            msg_out.set_video_frame(vf);
-            Ok(msg_out)
+            Ok(vf)
         } else {
             Err(anyhow!("no valid frame"))
         }
     }
 
-    fn use_yuv(&self) -> bool {
-        false
+    fn yuvfmt(&self) -> crate::EncodeYuvFormat {
+        let pixfmt = if self.pixfmt == AVPixelFormat::AV_PIX_FMT_NV12 {
+            Pixfmt::NV12
+        } else {
+            Pixfmt::I420
+        };
+        let stride = self
+            .encoder
+            .linesize
+            .clone()
+            .drain(..)
+            .map(|i| i as usize)
+            .collect();
+        crate::EncodeYuvFormat {
+            pixfmt,
+            w: self.encoder.ctx.width as _,
+            h: self.encoder.ctx.height as _,
+            stride,
+            u: self.encoder.offset[0] as _,
+            v: if pixfmt == Pixfmt::NV12 {
+                0
+            } else {
+                self.encoder.offset[1] as _
+            },
+        }
     }
 
-    fn set_bitrate(&mut self, bitrate: u32) -> ResultType<()> {
-        self.encoder.set_bitrate((bitrate * 1000) as _).ok();
+    fn set_quality(&mut self, quality: crate::codec::Quality) -> ResultType<()> {
+        let b = Self::convert_quality(quality);
+        let bitrate = base_bitrate(self.width as _, self.height as _) * b / 100;
+        if bitrate > 0 {
+            self.encoder.set_bitrate((bitrate * 1000) as _).ok();
+            self.bitrate = bitrate;
+        }
         Ok(())
+    }
+
+    fn bitrate(&self) -> u32 {
+        self.bitrate
     }
 }
 
@@ -128,35 +166,24 @@ impl HwEncoder {
         })
     }
 
-    pub fn encode(&mut self, bgra: &[u8]) -> ResultType<Vec<EncodeFrame>> {
-        match self.pixfmt {
-            AVPixelFormat::AV_PIX_FMT_YUV420P => hw::hw_bgra_to_i420(
-                self.encoder.ctx.width as _,
-                self.encoder.ctx.height as _,
-                &self.encoder.linesize,
-                &self.encoder.offset,
-                self.encoder.length,
-                bgra,
-                &mut self.yuv,
-            ),
-            AVPixelFormat::AV_PIX_FMT_NV12 => hw::hw_bgra_to_nv12(
-                self.encoder.ctx.width as _,
-                self.encoder.ctx.height as _,
-                &self.encoder.linesize,
-                &self.encoder.offset,
-                self.encoder.length,
-                bgra,
-                &mut self.yuv,
-            ),
-        }
-
-        match self.encoder.encode(&self.yuv) {
+    pub fn encode(&mut self, yuv: &[u8]) -> ResultType<Vec<EncodeFrame>> {
+        match self.encoder.encode(yuv) {
             Ok(v) => {
                 let mut data = Vec::<EncodeFrame>::new();
                 data.append(v);
                 Ok(data)
             }
             Err(_) => Ok(Vec::<EncodeFrame>::new()),
+        }
+    }
+
+    pub fn convert_quality(quality: crate::codec::Quality) -> u32 {
+        use crate::codec::Quality;
+        match quality {
+            Quality::Best => 150,
+            Quality::Balanced => 100,
+            Quality::Low => 50,
+            Quality::Custom(b) => b,
         }
     }
 }
@@ -208,6 +235,7 @@ impl HwDecoder {
         let ctx = DecodeContext {
             name: info.name.clone(),
             device_type: info.hwdevice.clone(),
+            thread_count: codec_thread_num() as _,
         };
         match Decoder::new(ctx) {
             Ok(decoder) => Ok(HwDecoder { decoder, info }),
@@ -217,7 +245,7 @@ impl HwDecoder {
     pub fn decode(&mut self, data: &[u8]) -> ResultType<Vec<HwDecoderImage>> {
         match self.decoder.decode(data) {
             Ok(v) => Ok(v.iter().map(|f| HwDecoderImage { frame: f }).collect()),
-            Err(_) => Ok(vec![]),
+            Err(e) => Err(anyhow!(e)),
         }
     }
 }
@@ -246,7 +274,7 @@ impl HwDecoderImage<'_> {
                 &mut rgb.raw as _,
                 i420,
                 HW_STRIDE_ALIGN,
-            ),
+            )?,
             AVPixelFormat::AV_PIX_FMT_YUV420P => {
                 hw::hw_i420_to(
                     rgb.fmt(),
@@ -259,10 +287,10 @@ impl HwDecoderImage<'_> {
                     frame.linesize[1] as _,
                     frame.linesize[2] as _,
                     &mut rgb.raw as _,
-                );
-                return Ok(());
+                )?;
             }
         }
+        Ok(())
     }
 
     pub fn bgra(&self, bgra: &mut Vec<u8>, i420: &mut Vec<u8>) -> ResultType<()> {
@@ -281,7 +309,7 @@ impl HwDecoderImage<'_> {
 }
 
 fn get_config(k: &str) -> ResultType<CodecInfos> {
-    let v = HwCodecConfig::get()
+    let v = HwCodecConfig::load()
         .options
         .get(k)
         .unwrap_or(&"".to_owned())
@@ -304,6 +332,7 @@ pub fn check_config() {
         gop: DEFAULT_GOP,
         quality: DEFAULT_HW_QUALITY,
         rc: DEFAULT_RC,
+        thread_count: 4,
     };
     let encoders = CodecInfo::score(Encoder::available_encoders(ctx));
     let decoders = CodecInfo::score(Decoder::available_decoders());
@@ -329,37 +358,29 @@ pub fn check_config() {
 }
 
 pub fn check_config_process() {
-    use hbb_common::sysinfo::{ProcessExt, System, SystemExt};
-
-    std::thread::spawn(move || {
-        // Remove to avoid checking process errors
+    use std::sync::Once;
+    let f = || {
+        // Clear to avoid checking process errors
         // But when the program is just started, the configuration file has not been updated, and the new connection will read an empty configuration
-        HwCodecConfig::remove();
+        // TODO: --server start multi times on windows startup, which will clear the last config and cause concurrent file writing
+        HwCodecConfig::clear();
         if let Ok(exe) = std::env::current_exe() {
-            if let Some(file_name) = exe.file_name().to_owned() {
-                let s = System::new_all();
+            if let Some(_) = exe.file_name().to_owned() {
                 let arg = "--check-hwcodec-config";
-                for process in s.processes_by_name(&file_name.to_string_lossy().to_string()) {
-                    if process.cmd().iter().any(|cmd| cmd.contains(arg)) {
-                        log::warn!("already have process {}", arg);
-                        return;
-                    }
-                }
                 if let Ok(mut child) = std::process::Command::new(exe).arg(arg).spawn() {
-                    // wait up to 10 seconds
-                    for _ in 0..10 {
+                    // wait up to 30 seconds, it maybe slow on windows startup for poorly performing machines
+                    for _ in 0..30 {
                         std::thread::sleep(std::time::Duration::from_secs(1));
-                        if let Ok(Some(status)) = child.try_wait() {
-                            if status.success() {
-                                HwCodecConfig::refresh();
-                            }
+                        if let Ok(Some(_)) = child.try_wait() {
                             break;
                         }
                     }
                     allow_err!(child.kill());
                     std::thread::sleep(std::time::Duration::from_millis(30));
                     match child.try_wait() {
-                        Ok(Some(status)) => log::info!("Check hwcodec config, exit with: {status}"),
+                        Ok(Some(status)) => {
+                            log::info!("Check hwcodec config, exit with: {status}")
+                        }
                         Ok(None) => {
                             log::info!(
                                 "Check hwcodec config, status not ready yet, let's really wait"
@@ -371,9 +392,12 @@ pub fn check_config_process() {
                             log::error!("Check hwcodec config, error attempting to wait: {e}")
                         }
                     }
-                    HwCodecConfig::refresh();
                 }
             }
         };
+    };
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(f);
     });
 }
