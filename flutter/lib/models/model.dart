@@ -395,8 +395,10 @@ class FfiModel with ChangeNotifier {
           msgBox(sessionId, 'custom-nook-nocancel-hasclose-info', 'Prompt',
               'elevated_switch_display_msg', '', parent.target!.dialogManager);
           bind.sessionSwitchDisplay(
-              sessionId: sessionId,
-              value: Int32List.fromList([pi.primaryDisplay]));
+            isDesktop: isDesktop,
+            sessionId: sessionId,
+            value: Int32List.fromList([pi.primaryDisplay]),
+          );
         }
       }
     }
@@ -413,18 +415,21 @@ class FfiModel with ChangeNotifier {
     }
   }
 
-  updateCurDisplay(SessionID sessionId) {
+  updateCurDisplay(SessionID sessionId, {updateCursorPos = true}) {
     final newRect = displaysRect();
     if (newRect == null) {
       return;
     }
     if (newRect != _rect) {
-      if (newRect.left != _rect?.left || newRect.top != _rect?.top) {
-        parent.target?.cursorModel
-            .updateDisplayOrigin(newRect.left, newRect.top);
+      if (updateCursorPos) {
+        if (newRect.left != _rect?.left || newRect.top != _rect?.top) {
+          parent.target?.cursorModel
+              .updateDisplayOrigin(newRect.left, newRect.top);
+        }
       }
       _rect = newRect;
-      parent.target?.canvasModel.updateViewStyle();
+      parent.target?.canvasModel
+          .updateViewStyle(refreshMousePos: updateCursorPos);
       _updateSessionWidthHeight(sessionId);
     }
   }
@@ -735,17 +740,9 @@ class FfiModel with ChangeNotifier {
   }
 
   checkDesktopKeyboardMode() async {
-    final curMode = await bind.sessionGetKeyboardMode(sessionId: sessionId);
-    if (curMode != null) {
-      if (bind.sessionIsKeyboardModeSupported(
-          sessionId: sessionId, mode: curMode)) {
-        return;
-      }
-    }
-
-    // If current keyboard mode is not supported, change to another one.
-
-    if (stateGlobal.grabKeyboard) {
+    if (isInputSourceFlutter) {
+      // Local side, flutter keyboard input source
+      // Currently only map mode is supported, legacy mode is used for compatibility.
       for (final mode in [kKeyMapMode, kKeyLegacyMode]) {
         if (bind.sessionIsKeyboardModeSupported(
             sessionId: sessionId, mode: mode)) {
@@ -754,6 +751,15 @@ class FfiModel with ChangeNotifier {
         }
       }
     } else {
+      final curMode = await bind.sessionGetKeyboardMode(sessionId: sessionId);
+      if (curMode != null) {
+        if (bind.sessionIsKeyboardModeSupported(
+            sessionId: sessionId, mode: curMode)) {
+          return;
+        }
+      }
+
+      // If current keyboard mode is not supported, change to another one.
       for (final mode in [kKeyMapMode, kKeyTranslateMode, kKeyLegacyMode]) {
         if (bind.sessionIsKeyboardModeSupported(
             sessionId: sessionId, mode: mode)) {
@@ -787,7 +793,10 @@ class FfiModel with ChangeNotifier {
 
     // move to the first display and set fullscreen
     bind.sessionSwitchDisplay(
-        sessionId: sessionId, value: Int32List.fromList([0]));
+      isDesktop: isDesktop,
+      sessionId: sessionId,
+      value: Int32List.fromList([0]),
+    );
     _pi.currentDisplay = 0;
     try {
       CurrentDisplayState.find(peerId).value = _pi.currentDisplay;
@@ -898,7 +907,10 @@ class FfiModel with ChangeNotifier {
                 : pi.primaryDisplay;
             final displays = newDisplay;
             bind.sessionSwitchDisplay(
-                sessionId: sessionId, value: Int32List.fromList([displays]));
+              isDesktop: isDesktop,
+              sessionId: sessionId,
+              value: Int32List.fromList([displays]),
+            );
 
             if (_pi.isSupportMultiUiSession) {
               // If the peer supports multi-ui-session, no switch display message will be send back.
@@ -943,12 +955,13 @@ class FfiModel with ChangeNotifier {
   }
 
   // Directly switch to the new display without waiting for the response.
-  switchToNewDisplay(int display, SessionID sessionId, String peerId) {
+  switchToNewDisplay(int display, SessionID sessionId, String peerId,
+      {bool updateCursorPos = true}) {
     // VideoHandler creation is upon when video frames are received, so either caching commands(don't know next width/height) or stopping recording when switching displays.
     parent.target?.recordingModel.onClose();
     // no need to wait for the response
     pi.currentDisplay = display;
-    updateCurDisplay(sessionId);
+    updateCurDisplay(sessionId, updateCursorPos: updateCursorPos);
     try {
       CurrentDisplayState.find(peerId).value = display;
     } catch (e) {
@@ -967,11 +980,21 @@ class FfiModel with ChangeNotifier {
   }
 
   updatePrivacyMode(
-      Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) async {
     notifyListeners();
     try {
-      PrivacyModeState.find(peerId).value = bind.sessionGetToggleOptionSync(
+      final isOn = bind.sessionGetToggleOptionSync(
           sessionId: sessionId, arg: 'privacy-mode');
+      if (isOn) {
+        var privacyModeImpl = await bind.sessionGetOption(
+            sessionId: sessionId, arg: 'privacy-mode-impl-key');
+        // For compatibility, version < 1.2.4, the default value is 'privacy_mode_impl_mag'.
+        final initDefaultPrivacyMode = 'privacy_mode_impl_mag';
+        PrivacyModeState.find(peerId).value =
+            privacyModeImpl ?? initDefaultPrivacyMode;
+      } else {
+        PrivacyModeState.find(peerId).value = '';
+      }
     } catch (e) {
       //
     }
@@ -1223,7 +1246,7 @@ class CanvasModel with ChangeNotifier {
       ? windowBorderWidth + kDragToResizeAreaPadding.bottom
       : 0;
 
-  updateViewStyle() async {
+  updateViewStyle({refreshMousePos = true}) async {
     Size getSize() {
       final size = MediaQueryData.fromWindow(ui.window).size;
       // If minimized, w or h may be negative here.
@@ -1264,7 +1287,9 @@ class CanvasModel with ChangeNotifier {
     _y = (size.height - displayHeight * _scale) / 2;
     _imageOverflow.value = _x < 0 || y < 0;
     notifyListeners();
-    parent.target?.inputModel.refreshMousePos();
+    if (refreshMousePos) {
+      parent.target?.inputModel.refreshMousePos();
+    }
   }
 
   updateScrollStyle() async {

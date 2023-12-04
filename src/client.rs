@@ -1552,9 +1552,11 @@ impl LoginConfigHandler {
         }
         let mut n = 0;
         let mut msg = OptionMessage::new();
-        if self.get_toggle_option("privacy-mode") {
-            msg.privacy_mode = BoolOption::Yes.into();
-            n += 1;
+        if self.version < hbb_common::get_version_number("1.2.4") {
+            if self.get_toggle_option("privacy-mode") {
+                msg.privacy_mode = BoolOption::Yes.into();
+                n += 1;
+            }
         }
         if n > 0 {
             Some(msg)
@@ -2083,7 +2085,7 @@ where
                         }
                     }
                     MediaData::RecordScreen(start, display, w, h, id) => {
-                        log::info!("record screen command: start:{start}, display:{display}");
+                        log::info!("record screen command: start: {start}, display: {display}");
                         if handler_controller_map.len() == 1 {
                             // Compatible with the sciter version(single ui session).
                             // For the sciter version, there're no multi-ui-sessions for one connection.
