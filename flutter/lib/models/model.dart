@@ -138,21 +138,29 @@ class FfiModel with ChangeNotifier {
     sessionId = parent.target!.sessionId;
   }
 
-  Rect? globalDisplaysRect() => _getDisplaysRect(_pi.displays);
-  Rect? displaysRect() => _getDisplaysRect(_pi.getCurDisplays());
-  Rect? _getDisplaysRect(List<Display> displays) {
+  Rect? globalDisplaysRect() => _getDisplaysRect(_pi.displays, true);
+  Rect? displaysRect() => _getDisplaysRect(_pi.getCurDisplays(), false);
+  Rect? _getDisplaysRect(List<Display> displays, bool useDisplayScale) {
     if (displays.isEmpty) {
       return null;
     }
+    int scale(int len, double s) {
+      if (useDisplayScale) {
+        return len.toDouble() ~/ s;
+      } else {
+        return len;
+      }
+    }
+
     double l = displays[0].x;
     double t = displays[0].y;
-    double r = displays[0].x + displays[0].width;
-    double b = displays[0].y + displays[0].height;
+    double r = displays[0].x + scale(displays[0].width, displays[0].scale);
+    double b = displays[0].y + scale(displays[0].height, displays[0].scale);
     for (var display in displays.sublist(1)) {
       l = min(l, display.x);
       t = min(t, display.y);
-      r = max(r, display.x + display.width);
-      b = max(b, display.y + display.height);
+      r = max(r, display.x + scale(display.width, display.scale));
+      b = max(b, display.y + scale(display.height, display.scale));
     }
     return Rect.fromLTRB(l, t, r, b);
   }
@@ -245,6 +253,8 @@ class FfiModel with ChangeNotifier {
       var name = evt['name'];
       if (name == 'msgbox') {
         handleMsgBox(evt, sessionId, peerId);
+      } else if (name == 'set_multiple_windows_session') {
+        handleMultipleWindowsSession(evt, sessionId, peerId);
       } else if (name == 'peer_info') {
         handlePeerInfo(evt, peerId, false);
       } else if (name == 'sync_peer_info') {
@@ -355,15 +365,29 @@ class FfiModel with ChangeNotifier {
         if (isDesktop) {
           gFFI.cmFileModel.onFileTransferLog(evt);
         }
+      } else if (name == 'sync_peer_option') {
+        _handleSyncPeerOption(evt, peerId);
       } else {
         debugPrint('Unknown event name: $name');
       }
     };
   }
 
+  _handleSyncPeerOption(Map<String, dynamic> evt, String peer) {
+    final k = evt['k'];
+    final v = evt['v'];
+    if (k == kOptionViewOnly) {
+      setViewOnly(peer, v as bool);
+    } else if (k == 'keyboard_mode') {
+      parent.target?.inputModel.updateKeyboardMode();
+    } else if (k == 'input_source') {
+      stateGlobal.getInputSource(force: true);
+    }
+  }
+
   onUrlSchemeReceived(Map<String, dynamic> evt) {
     final url = evt['url'].toString().trim();
-    if (url.startsWith(kUniLinksPrefix) && handleUriLink(uriString: url)) {
+    if (url.startsWith(bind.mainUriPrefixSync()) && handleUriLink(uriString: url)) {
       return;
     }
     switch (url) {
@@ -460,6 +484,7 @@ class FfiModel with ChangeNotifier {
         int.tryParse(evt['original_width']) ?? kInvalidResolutionValue;
     newDisplay.originalHeight =
         int.tryParse(evt['original_height']) ?? kInvalidResolutionValue;
+    newDisplay._scale = _pi.scaleOfDisplay(display);
     _pi.displays[display] = newDisplay;
 
     if (!_pi.isSupportMultiUiSession || _pi.currentDisplay == display) {
@@ -488,6 +513,19 @@ class FfiModel with ChangeNotifier {
     dialogManager.dismissByTag(tag);
   }
 
+  handleMultipleWindowsSession(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+    if (parent.target == null) return;
+    final dialogManager = parent.target!.dialogManager;
+    final sessions = evt['windows_sessions'];
+    final title = translate('Multiple Windows sessions found');
+    final text = translate('Please select the session you want to connect to');
+    final type = "";
+
+    showWindowsSessionsDialog(
+        type, title, text, dialogManager, sessionId, peerId, sessions);
+  }
+
   /// Handle the message box event based on [evt] and [id].
   handleMsgBox(Map<String, dynamic> evt, SessionID sessionId, String peerId) {
     if (parent.target == null) return;
@@ -498,6 +536,8 @@ class FfiModel with ChangeNotifier {
     final link = evt['link'];
     if (type == 're-input-password') {
       wrongPasswordDialog(sessionId, dialogManager, type, title, text);
+    } else if (type == 'input-2fa') {
+      enter2FaDialog(sessionId, dialogManager);
     } else if (type == 'input-password') {
       enterPasswordDialog(sessionId, dialogManager);
     } else if (type == 'session-login' || type == 'session-re-login') {
@@ -711,7 +751,7 @@ class FfiModel with ChangeNotifier {
       setViewOnly(
           peerId,
           bind.sessionGetToggleOptionSync(
-              sessionId: sessionId, arg: 'view-only'));
+              sessionId: sessionId, arg: kOptionViewOnly));
     }
     if (connType == ConnType.defaultConn) {
       final platformAdditions = evt['platform_additions'];
@@ -859,6 +899,8 @@ class FfiModel with ChangeNotifier {
     d.cursorEmbedded = evt['cursor_embedded'] == 1;
     d.originalWidth = evt['original_width'] ?? kInvalidResolutionValue;
     d.originalHeight = evt['original_height'] ?? kInvalidResolutionValue;
+    double v = (evt['scale']?.toDouble() ?? 100.0) / 100;
+    d._scale = v > 1.0 ? v : 1.0;
     return d;
   }
 
@@ -2097,6 +2139,7 @@ class FFI {
   late final InputModel inputModel; // session
   late final ElevationModel elevationModel; // session
   late final CmFileModel cmFileModel; // cm
+  late final TextureModel textureModel; //session
 
   FFI(SessionID? sId) {
     sessionId = sId ?? (isDesktop ? Uuid().v4obj() : _constSessionId);
@@ -2116,6 +2159,7 @@ class FFI {
     inputModel = InputModel(WeakReference(this));
     elevationModel = ElevationModel(WeakReference(this));
     cmFileModel = CmFileModel(WeakReference(this));
+    textureModel = TextureModel(WeakReference(this));
   }
 
   /// Mobile reuse FFI
@@ -2195,6 +2239,9 @@ class FFI {
       }
     }
 
+    final hasPixelBufferTextureRender = bind.mainHasPixelbufferTextureRender();
+    final hasGpuTextureRender = bind.mainHasGpuTextureRender();
+
     final SimpleWrapper<bool> isToNewWindowNotified = SimpleWrapper(false);
     // Preserved for the rgba data.
     stream.listen((message) {
@@ -2240,7 +2287,9 @@ class FFI {
           }
         } else if (message is EventToUI_Rgba) {
           final display = message.field0;
-          if (useTextureRender) {
+          if (hasPixelBufferTextureRender) {
+            debugPrint("EventToUI_Rgba display:$display");
+            textureModel.setTextureType(display: display, gpuTexture: false);
             onEvent2UIRgba();
           } else {
             // Fetch the image buffer from rust codes.
@@ -2253,6 +2302,13 @@ class FFI {
               onEvent2UIRgba();
               imageModel.onRgba(display, rgba);
             }
+          }
+        } else if (message is EventToUI_Texture) {
+          final display = message.field0;
+          debugPrint("EventToUI_Texture display:$display");
+          if (hasGpuTextureRender) {
+            textureModel.setTextureType(display: display, gpuTexture: true);
+            onEvent2UIRgba();
           }
         }
       }();
@@ -2287,6 +2343,10 @@ class FFI {
         osPassword: osPassword,
         password: password,
         remember: remember);
+  }
+
+  void send2FA(SessionID sessionId, String code) {
+    bind.sessionSend2Fa(sessionId: sessionId, code: code);
   }
 
   /// Close the remote session.
@@ -2335,6 +2395,8 @@ class Display {
   bool cursorEmbedded = false;
   int originalWidth = kInvalidResolutionValue;
   int originalHeight = kInvalidResolutionValue;
+  double _scale = 1.0;
+  double get scale => _scale > 1.0 ? _scale : 1.0;
 
   Display() {
     width = (isDesktop || isWebDesktop)
@@ -2453,6 +2515,13 @@ class PeerInfo with ChangeNotifier {
         return [];
       }
     }
+  }
+
+  double scaleOfDisplay(int display) {
+    if (display >= 0 && display < displays.length) {
+      return displays[display].scale;
+    }
+    return 1.0;
   }
 }
 
